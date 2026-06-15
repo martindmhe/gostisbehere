@@ -40,8 +40,11 @@ class Config:
     # --- Auth (from browser DevTools → Network → any api.resy.com request) ---
     api_key: str = "PASTE_STATIC_API_KEY"          # the value inside Authorization
     auth_token: str = "PASTE_USER_JWT"             # X-Resy-Auth-Token / X-Resy-Universal-Auth
-    # Only needed for venues that take a card hold/deposit. Your captured /book
-    # payload had NO struct_payment_method, so leave 0 unless this venue requires it.
+    # Set requires_payment (--requires-payment) for venues that take a card hold/deposit
+    # at booking. When set, a payment_method_id is REQUIRED (from RESY_PAYMENT_METHOD_ID /
+    # PAYMENT_METHOD_ID env) and sent to /book as struct_payment_method. Leave off for
+    # free venues (most), where /book takes no payment field.
+    requires_payment: bool = False
     payment_method_id: int = 0
 
     # --- Target reservation ---
@@ -301,8 +304,12 @@ async def book(client: httpx.AsyncClient, cfg: Config, book_token: str) -> dict:
         "source_id": "resy.com-venue-details",
         "venue_marketing_opt_in": 0,
     }
-    if cfg.payment_method_id:
-        body["struct_payment_method"] = json.dumps({"id": cfg.payment_method_id})
+    if cfg.requires_payment or cfg.payment_method_id:
+        # MUST be a JSON STRING literal field value, compact (no spaces) to match the
+        # real /book capture exactly:  struct_payment_method={"id":35973316}
+        body["struct_payment_method"] = json.dumps(
+            {"id": cfg.payment_method_id}, separators=(",", ":")
+        )
 
     resp = await client.post(URL_BOOK, data=body)
     _raise_for_resy(resp)
@@ -459,21 +466,21 @@ async def run(cfg: Config) -> None:
                 print(f"          policy: {line}")
 
         if cfg.dry_run:
-            print("\n🧪 DRY RUN — pipeline reached /book and stopped (no reservation made).")
-            print(f"   slot time      : {start}")
-            print(f"   config_id      : {config_token}")
-            print(f"   book_token     : {book_token[:60]}…")
-            print(f"   payment_required: {details.payment_required}"
+            print("\nDRY RUN — pipeline reached /book and stopped (no reservation made).")
+            print(f"slot time      : {start}")
+            print(f"config_id      : {config_token}")
+            print(f"book_token     : {book_token[:60]}…")
+            print(f"payment_required: {details.payment_required}"
                   + (f" (${details.total_due}, pm={cfg.payment_method_id})"
                      if details.payment_required else ""))
             return
 
         # --- finalize ---
         result = await book(client, cfg, book_token)
-        print("\n✅ BOOKED.")
-        print(f"   slot time     : {start}")
-        print(f"   reservation_id: {result.get('reservation_id')}")
-        print(f"   resy_token    : {result.get('resy_token')}")
+        print("\Booking Successful")
+        print(f"slot time     : {start}")
+        print(f"reservation_id: {result.get('reservation_id')}")
+        print(f"resy_token    : {result.get('resy_token')}")
 
 
 def _build_config(args: argparse.Namespace) -> Config:
@@ -487,11 +494,19 @@ def _build_config(args: argparse.Namespace) -> Config:
 
     cfg.api_key = args.api_key or os.environ.get("RESY_API_KEY", cfg.api_key)
     cfg.auth_token = args.auth_token or os.environ.get("RESY_AUTH_TOKEN", cfg.auth_token)
-    env_pm = os.environ.get("RESY_PAYMENT_METHOD_ID")
+    env_pm = os.environ.get("RESY_PAYMENT_METHOD_ID") or os.environ.get("PAYMENT_METHOD_ID")
     if args.payment_method_id is not None:
         cfg.payment_method_id = args.payment_method_id
     elif env_pm:
         cfg.payment_method_id = int(env_pm)
+
+    cfg.requires_payment = args.requires_payment
+    if cfg.requires_payment and not cfg.payment_method_id:
+        # Fail fast at config time — never discover a missing card mid-drop.
+        raise SystemExit(
+            "--requires-payment is set but no payment method id found. Export "
+            "RESY_PAYMENT_METHOD_ID (or PAYMENT_METHOD_ID), or pass --payment-method-id."
+        )
 
     if args.venue_id is not None:
         cfg.venue_id = args.venue_id
@@ -553,6 +568,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--auth-token", help="X-Resy-Auth-Token JWT (overrides RESY_AUTH_TOKEN)")
     p.add_argument("--payment-method-id", type=int,
                    help="Payment profile id (only for venues with a card hold)")
+    p.add_argument("--requires-payment", action="store_true",
+                   help="Venue takes a deposit/card hold: require a payment method id "
+                        "(RESY_PAYMENT_METHOD_ID / PAYMENT_METHOD_ID env) and send it to /book")
     # Mode
     p.add_argument("--dry-run", action="store_true",
                    help="Run find + details but STOP before /book (no reservation made)")
@@ -574,11 +592,11 @@ def main() -> None:
     try:
         asyncio.run(run(cfg))
     except TokenExpired as e:
-        print(f"\n❌ Auth rejected — re-grab X-Resy-Auth-Token from the browser. ({e})")
+        print(f"\nERROR: Auth rejected — re-grab X-Resy-Auth-Token from the browser. ({e})")
     except RateLimited as e:
-        print(f"\n❌ Rate-limited / Cloudflare challenge. Slow down and retry next drop. ({e})")
+        print(f"\nERROR: Rate-limited / Cloudflare challenge. Slow down and retry next drop. ({e})")
     except TimeoutError as e:
-        print(f"\n❌ {e}")
+        print(f"\nERROR: {e}")
     except KeyboardInterrupt:
         print("\nInterrupted.")
 
