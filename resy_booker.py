@@ -24,8 +24,10 @@ import asyncio
 import json
 import os
 import random
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -62,7 +64,7 @@ class Config:
     # Preferred dining time(s), 24h "HH:MM", in priority order.
     # The first slot whose start time falls in [pref - tolerance, pref + tolerance] wins.
     preferred_times: tuple[str, ...] = ("19:00", "19:30", "18:30", "20:00")
-    time_tolerance_min: int = 15                    # +/- minutes around each preferred time
+    time_tolerance_min: int = 69                    # +/- minutes around each preferred time
 
     # --- Drop timing (when reservations are released) ---
     # Le Gratin releases 30 days ahead at midnight ET, so dining 2026-07-21 drops
@@ -86,6 +88,18 @@ class Config:
     # --- Networking ---
     request_timeout_s: float = 4.0
     max_inflight_finds: int = 3                     # cap concurrent find() calls
+
+    # --- Clock calibration ---
+    # The drop fires on Resy's clock, not yours. A laptop clock can drift hundreds of
+    # ms, which makes "start polling 1s before drop" silently late. We discipline our
+    # schedule against the server's own time via HTTP Date-header edge detection, then
+    # drive every sleep/deadline off the corrected (server) clock.
+    clock_sync: bool = True
+    clock_sync_max_s: float = 3.0                   # time budget for the calibration burst
+    clock_sync_interval_s: float = 0.08             # spacing between probe requests
+    clock_sync_min_edges: int = 2                   # second-ticks needed for a trusted estimate
+    clock_sync_recalibrate_lead_s: float = 60.0     # fresh offset this many seconds before drop
+    clock_offset_s: float = 0.0                     # measured at runtime: server_time - local_time
 
     headers: dict = field(default_factory=dict)
 
@@ -326,11 +340,82 @@ async def book(client: httpx.AsyncClient, cfg: Config, book_token: str) -> dict:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-async def _sleep_until(when: datetime) -> None:
-    now = datetime.now(when.tzinfo)
-    delta = (when - now).total_seconds()
+def _server_now(tz: ZoneInfo, offset_s: float) -> datetime:
+    """Local wall clock corrected to the server's clock (server_time = local + offset)."""
+    return datetime.now(tz) + timedelta(seconds=offset_s)
+
+
+async def _sleep_until(when: datetime, offset_s: float = 0.0) -> None:
+    """Sleep until the *server* clock reaches `when` (a server-time instant)."""
+    delta = (when - _server_now(when.tzinfo, offset_s)).total_seconds()
     if delta > 0:
         await asyncio.sleep(delta)
+
+
+async def calibrate_clock(client: httpx.AsyncClient, cfg: Config) -> float:
+    """
+    Estimate (server_time - local_time) in seconds so the drop schedule rides Resy's
+    clock instead of ours.
+
+    The HTTP `Date` header is whole-second resolution, so a single read only pins us to
+    ±1s. We instead fire a tight burst of cheap probes and watch for the second value to
+    *tick over*: the instant it crosses from N to N+1, the server clock is exactly N+1.000.
+    That tick is bracketed between the two surrounding probes, so its local time is the
+    midpoint of their midpoints — sub-RTT precision. We collect several ticks and take the
+    median offset of the lowest-RTT (cleanest) samples.
+
+    Returns 0.0 on any failure, which leaves the bot on the bare local clock (prior behavior).
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + cfg.clock_sync_max_s
+    samples: list[tuple[float, float]] = []  # (offset_s, rtt_s)
+    prev_secs: int | None = None
+    prev_mid: float | None = None
+
+    while loop.time() < deadline:
+        t0 = time.time()
+        try:
+            # HEAD against the API host: Cloudflare stamps a fresh `Date` on every
+            # response (even errors), and HEAD carries no body — a near-free probe.
+            resp = await client.head(BASE + "/")
+        except Exception:  # noqa: BLE001 — a flaky probe just costs us one sample
+            await asyncio.sleep(cfg.clock_sync_interval_s)
+            continue
+        t1 = time.time()
+        mid = (t0 + t1) / 2
+
+        date_hdr = resp.headers.get("date")
+        secs: int | None = None
+        if date_hdr:
+            try:
+                secs = int(parsedate_to_datetime(date_hdr).timestamp())
+            except (TypeError, ValueError, OverflowError):
+                secs = None
+
+        if secs is not None:
+            if prev_secs is not None and prev_mid is not None and secs == prev_secs + 1:
+                # The tick into `secs`.000 happened between the two probes' midpoints.
+                tick_local = (prev_mid + mid) / 2
+                samples.append((secs - tick_local, t1 - t0))
+            prev_secs, prev_mid = secs, mid
+
+        await asyncio.sleep(cfg.clock_sync_interval_s)
+
+    if len(samples) < cfg.clock_sync_min_edges:
+        print(f"[clock] only caught {len(samples)} tick(s) "
+              f"(< {cfg.clock_sync_min_edges}) — staying on local clock.")
+        return 0.0
+
+    # Prefer the lowest-RTT half (least path noise), then take the median offset.
+    samples.sort(key=lambda s: s[1])
+    offsets = sorted(o for o, _ in samples[: max(1, len(samples) // 2)])
+    offset = offsets[len(offsets) // 2]
+    print(f"[clock] offset = {offset * 1000:+.0f} ms (server - local), "
+          f"from {len(samples)} tick(s); driving the drop schedule off server time.")
+    if abs(offset) > 1.0:
+        print(f"[clock] WARNING: local clock is off by {offset:+.2f}s — "
+              "without this correction the bot would have been that far late/early.")
+    return offset
 
 
 async def prewarm(client: httpx.AsyncClient, cfg: Config) -> None:
@@ -362,7 +447,7 @@ async def poll_for_slot(client: httpx.AsyncClient, cfg: Config) -> dict:
     poll_start = drop - timedelta(seconds=cfg.poll_start_lead_s)
     deadline = drop + timedelta(seconds=cfg.poll_end_lag_s)
 
-    await _sleep_until(poll_start)
+    await _sleep_until(poll_start, cfg.clock_offset_s)
     print(f"[poll] window open. drop={drop.isoformat()} deadline={deadline.time()}")
 
     found: asyncio.Future[dict] = asyncio.get_event_loop().create_future()
@@ -394,7 +479,7 @@ async def poll_for_slot(client: httpx.AsyncClient, cfg: Config) -> dict:
     tasks: list[asyncio.Task] = []
     tick = 0
     loop = asyncio.get_event_loop()
-    while not found.done() and datetime.now(drop.tzinfo) < deadline:
+    while not found.done() and _server_now(drop.tzinfo, cfg.clock_offset_s) < deadline:
         if loop.time() >= backoff_until:
             tasks.append(asyncio.create_task(one_attempt()))
             tick += 1
@@ -434,8 +519,19 @@ async def run(cfg: Config) -> None:
         timeout=cfg.request_timeout_s,
         limits=limits,
     ) as client:
+        # --- calibrate, then re-calibrate ~1 min before the drop ---
+        if cfg.clock_sync:
+            print("Calibrating clock...")
+            cfg.clock_offset_s = await calibrate_clock(client, cfg)
+
+            if cfg.clock_sync_recalibrate_lead_s > 0:
+                recal_at = drop - timedelta(seconds=cfg.clock_sync_recalibrate_lead_s)
+                await _sleep_until(recal_at, cfg.clock_offset_s)
+                print(f"[clock] re-calibrating ({cfg.clock_sync_recalibrate_lead_s:.0f}s before drop)...")
+                cfg.clock_offset_s = await calibrate_clock(client, cfg)
+
         # --- pre-warm a few seconds before the drop ---
-        await _sleep_until(drop - timedelta(seconds=cfg.prewarm_lead_s))
+        await _sleep_until(drop - timedelta(seconds=cfg.prewarm_lead_s), cfg.clock_offset_s)
         await prewarm(client, cfg)
 
         # --- poll → first matching slot ---
@@ -538,6 +634,9 @@ def _build_config(args: argparse.Namespace) -> Config:
         cfg.drop_tz = args.drop_tz
 
     cfg.dry_run = args.dry_run
+    cfg.clock_sync = args.clock_sync
+    if args.clock_recalibrate_lead is not None:
+        cfg.clock_sync_recalibrate_lead_s = args.clock_recalibrate_lead
     return cfg
 
 
@@ -574,6 +673,11 @@ def _parse_args() -> argparse.Namespace:
     # Mode
     p.add_argument("--dry-run", action="store_true",
                    help="Run find + details but STOP before /book (no reservation made)")
+    p.add_argument("--no-clock-sync", dest="clock_sync", action="store_false",
+                   help="Disable server-clock calibration and trust the local clock")
+    p.add_argument("--clock-recalibrate-lead", type=float, metavar="SEC",
+                   help="Re-calibrate this many seconds before drop (default 60; 0 to skip)")
+    p.set_defaults(clock_sync=True)
     return p.parse_args()
 
 
