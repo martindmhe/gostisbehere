@@ -392,7 +392,17 @@ async def book(client: httpx.AsyncClient, cfg: Config, book_token: str) -> dict:
 
     resp = await client.post(URL_BOOK, data=body)
     _raise_for_resy(resp)
-    resp.raise_for_status()
+    if not (200 <= resp.status_code < 300):
+        # Dump the raw response so a failed /book tells us WHY (stale token, bad
+        # field, venue-side rejection) instead of a bare status-code traceback.
+        dump = os.path.join(os.path.dirname(os.path.abspath(__file__)), "book_dump.json")
+        with open(dump, "w") as f:
+            json.dump(
+                {"status": resp.status_code, "request_body": body, "response": resp.text},
+                f, indent=2,
+            )
+        print(f"[book] HTTP {resp.status_code} — full response written to {dump}")
+        resp.raise_for_status()
     payload = resp.json()
     # Confirmed response shape: {resy_token, reservation_id, venue_opt_in}
     if not payload.get("resy_token"):
