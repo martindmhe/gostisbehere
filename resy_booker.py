@@ -25,6 +25,7 @@ import json
 import os
 import random
 import time
+import tomllib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
@@ -61,6 +62,19 @@ class Config:
     lat: float = 0
     long: float = 0
 
+    # Direct-booking identity. When config_id is set we SKIP /find and construct the
+    # rgs:// token ourselves from the known params + these opaque pieces, then poll
+    # /details directly until inventory goes live. Shaves a round trip; the trade-off is
+    # no self-correction — if the pieces are wrong/stale for this drop, no /find fallback.
+    #   token = rgs://resy/<venue>/<config_id>/<mid_field>/<day>/<day>/<time>/<party>/<seating>
+    # config_id and mid_field are read off a real captured token (we can't compute them);
+    # everything else is your normal reservation params.
+    config_id: int | None = None       # the opaque slot/template id, e.g. 3593815
+    mid_field: int | None = None       # the opaque field right after config_id (e.g. 2 or 3)
+    time: str = ""                     # exact slot time "HH:MM:SS" (direct mode)
+    seating: str = ""                  # seating-type label, e.g. "Indoor Dining"
+    config_token: str = ""             # constructed at runtime from the pieces above
+
     # Preferred dining time(s), 24h "HH:MM", in priority order.
     # The first slot whose start time falls in [pref - tolerance, pref + tolerance] wins.
     preferred_times: tuple[str, ...] = ("19:00", "19:30", "18:30", "20:00")
@@ -77,6 +91,7 @@ class Config:
 
     # --- Mode ---
     dry_run: bool = False                           # find + details, but STOP before /book
+    probe: bool = False                             # one immediate /details, report, exit
 
     # --- Timing window (seconds relative to drop) ---
     prewarm_lead_s: float = 5.0                     # open + warm the connection this early
@@ -208,6 +223,31 @@ def _slot_token(slot: dict) -> str | None:
     return (slot.get("config") or {}).get("token")
 
 
+def _build_config_token(cfg: Config) -> str:
+    """
+    Construct the rgs:// config token from known params + the two opaque pieces the API
+    won't let us compute (config_id, mid_field). Layout, verified against real captures:
+        rgs://resy/<venue>/<config_id>/<mid_field>/<day>/<day>/<time>/<party>/<seating>
+    e.g. rgs://resy/6194/3593815/3/2026-07-15/2026-07-15/12:00:00/2/Indoor Dining
+
+    We build it rather than paste-and-parse so the reservation params have a single
+    source of truth. The format must match byte-for-byte — in direct mode there is no
+    /find fallback — so the dining params feeding this are exactly those used elsewhere.
+    """
+    return (
+        f"rgs://resy/{cfg.venue_id}/{cfg.config_id}/{cfg.mid_field}/"
+        f"{cfg.day}/{cfg.day}/{cfg.time}/{cfg.party_size}/{cfg.seating}"
+    )
+
+
+def _direct_slot_start(cfg: Config) -> datetime | None:
+    """The slot's start datetime, straight from the run's own params (for logging)."""
+    try:
+        return datetime.strptime(f"{cfg.day} {cfg.time}", "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
 def _raise_for_resy(resp: httpx.Response) -> None:
     if resp.status_code == 429:
         raise RateLimited(f"429 from {resp.url}")
@@ -236,7 +276,7 @@ def _find_body(cfg: Config) -> dict:
 async def find_slot(client: httpx.AsyncClient, cfg: Config) -> dict | None:
     resp = await client.post(URL_FIND, json=_find_body(cfg))
     _raise_for_resy(resp)
-    if resp.status_code != 200:
+    if not (200 <= resp.status_code < 300):  # accept any 2xx, not just 200
         return None
     return _pick_best_slot(resp.json(), cfg)
 
@@ -284,7 +324,14 @@ def _parse_details(payload: dict) -> DetailsResult:
     )
 
 
-async def get_book_token(client: httpx.AsyncClient, cfg: Config, config_token: str) -> DetailsResult:
+async def get_book_token(
+    client: httpx.AsyncClient,
+    cfg: Config,
+    config_token: str,
+    *,
+    dump_on_missing: bool = True,
+    debug_sink: dict | None = None,
+) -> DetailsResult | None:
     # details body — JSON. `commit: 0` matches the real browser capture (preview,
     # don't lock). config_id is the rgs:// slot token from find().
     body = {
@@ -295,11 +342,29 @@ async def get_book_token(client: httpx.AsyncClient, cfg: Config, config_token: s
     }
     resp = await client.post(URL_DETAILS, json=body)
     _raise_for_resy(resp)
-    resp.raise_for_status()
+
+    # CONFIRMED from capture: /details with commit:1 returns 201 Created (it mints a
+    # booking hold), and commit:0 returns 200 — so accept any 2xx. When polling directly
+    # (no /find), a not-yet-live or already-gone config comes back as a 4xx/5xx (e.g.
+    # 400/404/410). In that mode we treat "no token yet" as a retry signal (return None)
+    # rather than a hard failure, so the caller's poll loop keeps trying until inventory
+    # appears. We still record the raw response in debug_sink so a window that closes
+    # empty can tell us WHY (bad headers vs gating vs wrong token) instead of failing blind.
+    if not (200 <= resp.status_code < 300):
+        if debug_sink is not None:
+            debug_sink.update(status=resp.status_code, body=resp.text[:2000], request_body=body)
+        if dump_on_missing:
+            resp.raise_for_status()
+        return None
+
     payload = resp.json()
     try:
         return _parse_details(payload)
     except RuntimeError:
+        if debug_sink is not None:
+            debug_sink.update(status=200, body=payload, request_body=body)
+        if not dump_on_missing:
+            return None
         # Token missing — dump the full response so we can see what Resy actually
         # returned (commit semantics, gating, GDA, etc.) instead of guessing.
         dump = os.path.join(os.path.dirname(os.path.abspath(__file__)), "details_dump.json")
@@ -420,15 +485,28 @@ async def calibrate_clock(client: httpx.AsyncClient, cfg: Config) -> float:
 
 async def prewarm(client: httpx.AsyncClient, cfg: Config) -> None:
     """
-    Force the TCP + TLS handshake (and HTTP/2 session) to be live before the drop,
-    so the first real find() pays no connection-setup cost. We use a cheap GET
-    against the same host. A failure here is non-fatal — log and continue.
+    Force the TCP + TLS handshake (and HTTP/2 session) to be live before the drop, so
+    the first real request pays no connection-setup cost. The warm-up doubles as an auth
+    check — a dead JWT fails here, before timing matters.
+
+    In --config-id mode we warm the exact endpoint we'll hammer (/details, commit:0
+    preview) so we never touch /find; otherwise we warm with a lightweight /find.
     """
     try:
-        # A lightweight find() with the real params doubles as a warm-up AND
-        # tells us auth is valid before it matters.
-        await client.post(URL_FIND, json=_find_body(cfg))
-        print("[prewarm] connection established, auth accepted.")
+        if cfg.config_token:
+            # commit:0 = preview (no reserve-intent, no lock). Pre-drop this returns no
+            # book_token, which is fine — we only need the connection warm + auth checked.
+            resp = await client.post(URL_DETAILS, json={
+                "commit": 0,
+                "config_id": cfg.config_token,
+                "day": cfg.day,
+                "party_size": cfg.party_size,
+            })
+            _raise_for_resy(resp)
+            print("[prewarm] connection established, auth accepted (warmed /details).")
+        else:
+            await client.post(URL_FIND, json=_find_body(cfg))
+            print("[prewarm] connection established, auth accepted.")
     except TokenExpired:
         raise  # do not start the run with a dead token
     except RateLimited:
@@ -498,6 +576,132 @@ async def poll_for_slot(client: httpx.AsyncClient, cfg: Config) -> dict:
     raise TimeoutError("No matching slot appeared inside the polling window.")
 
 
+async def poll_book_token_direct(client: httpx.AsyncClient, cfg: Config) -> DetailsResult:
+    """
+    --config-id path: SKIP /find and hammer /details with the known config token until
+    inventory goes live and it mints a book_token. Same window/cadence/backoff as
+    poll_for_slot, but the unit of work is a /details call and the prize is a
+    DetailsResult (not a slot dict). First success wins and cancels the rest.
+    """
+    drop = _drop_datetime(cfg)
+    poll_start = drop - timedelta(seconds=cfg.poll_start_lead_s)
+    deadline = drop + timedelta(seconds=cfg.poll_end_lag_s)
+
+    await _sleep_until(poll_start, cfg.clock_offset_s)
+    print(f"[poll] window open — DIRECT /details (no /find). "
+          f"drop={drop.isoformat()} deadline={deadline.time()}")
+
+    found: asyncio.Future[DetailsResult] = asyncio.get_event_loop().create_future()
+    sem = asyncio.Semaphore(cfg.max_inflight_finds)
+    backoff_until = 0.0
+    last_debug: dict = {}  # raw response of the most recent token-less attempt
+
+    async def one_attempt() -> None:
+        nonlocal backoff_until
+        async with sem:
+            if found.done():
+                return
+            try:
+                # dump_on_missing=False: "no token yet" is the expected pre-live state,
+                # so it returns None and we just retry next tick instead of bailing.
+                # debug_sink captures the raw response so an empty window isn't blind.
+                details = await get_book_token(
+                    client, cfg, cfg.config_token,
+                    dump_on_missing=False, debug_sink=last_debug,
+                )
+            except RateLimited:
+                backoff_until = asyncio.get_event_loop().time() + 0.75
+                return
+            except TokenExpired:
+                if not found.done():
+                    found.set_exception(TokenExpired("auth rejected mid-poll"))
+                return
+            except (httpx.TimeoutException, httpx.TransportError):
+                return
+            except Exception as e:  # noqa: BLE001 — record, don't let it vanish into the task
+                last_debug.update(error=repr(e))
+                return
+            if details and not found.done():
+                found.set_result(details)
+
+    tasks: list[asyncio.Task] = []
+    loop = asyncio.get_event_loop()
+    while not found.done() and _server_now(drop.tzinfo, cfg.clock_offset_s) < deadline:
+        if loop.time() >= backoff_until:
+            tasks.append(asyncio.create_task(one_attempt()))
+        gap = cfg.poll_interval_s + random.uniform(-cfg.poll_jitter_s, cfg.poll_jitter_s)
+        await asyncio.sleep(max(0.05, gap))
+
+    for t in tasks:
+        if not t.done():
+            t.cancel()
+
+    if found.done():
+        if found.exception():
+            raise found.exception()  # type: ignore[misc]
+        return found.result()
+
+    # Window closed empty. Surface the last raw /details response so we can see WHY
+    # (bad/missing auth header, gating, wrong token) instead of guessing.
+    if last_debug:
+        dump = os.path.join(os.path.dirname(os.path.abspath(__file__)), "details_dump.json")
+        try:
+            with open(dump, "w") as f:
+                json.dump(last_debug, f, indent=2, default=str)
+        except OSError:
+            pass
+        status = last_debug.get("status")
+        body = last_debug.get("body")
+        snippet = body if isinstance(body, str) else json.dumps(body, default=str)
+        print(f"[direct] last /details response: HTTP {status} — {str(snippet)[:500]}")
+        print(f"[direct] full response written to {dump}")
+    raise TimeoutError(
+        "No book_token from /details inside the polling window. See the [direct] response "
+        "above — a 4xx usually means an auth header / token problem, a 200 without a "
+        "book_token means gating. (No /find fallback in --config-id mode.)"
+    )
+
+
+async def probe_details(client: httpx.AsyncClient, cfg: Config) -> None:
+    """
+    One-shot diagnostic: fire a single /details for the constructed token RIGHT NOW
+    (no drop wait, no booking) and report exactly what Resy returns. Use it against a
+    currently-bookable slot to confirm the token pieces + auth headers before a drop.
+    """
+    print(f"[probe] config token: {cfg.config_token}")
+    print(f"[probe] body: commit={cfg.commit} day={cfg.day} party_size={cfg.party_size}")
+    sink: dict = {}
+    try:
+        details = await get_book_token(
+            client, cfg, cfg.config_token, dump_on_missing=False, debug_sink=sink
+        )
+    except TokenExpired as e:
+        print(f"[probe] AUTH REJECTED (401/403) — header/token problem: {e}")
+        return
+    except RateLimited as e:
+        print(f"[probe] RATE LIMITED / Cloudflare challenge: {e}")
+        return
+
+    if details:
+        print("[probe] SUCCESS ✓ — /details minted a book_token with this exact token.")
+        print(f"        book_token      : {details.book_token[:60]}…")
+        print(f"        payment_required: {details.payment_required}"
+              + (f" (total ${details.total_due})" if details.payment_required else ""))
+        return
+
+    status = sink.get("status")
+    body = sink.get("body")
+    snippet = body if isinstance(body, str) else json.dumps(body, default=str)
+    print(f"[probe] NO book_token — HTTP {status}")
+    print(f"        response: {str(snippet)[:1000]}")
+    if status and status != 200:
+        print("        → 4xx/5xx with a correct body usually means an AUTH HEADER issue "
+              "(api_key / JWT / a header the browser sends that we don't).")
+    else:
+        print("        → 200 but no token means gating (commit semantics, GDA, or the slot "
+              "isn't actually bookable right now).")
+
+
 async def run(cfg: Config) -> None:
     cfg.headers = cfg.build_headers()
     limits = httpx.Limits(max_keepalive_connections=8, max_connections=16)
@@ -519,6 +723,14 @@ async def run(cfg: Config) -> None:
         timeout=cfg.request_timeout_s,
         limits=limits,
     ) as client:
+        # --- probe: one immediate /details, report, exit (no drop wait, no booking) ---
+        if cfg.probe:
+            if not cfg.config_token:
+                raise SystemExit("--probe needs a constructed token (set config_id + "
+                                 "mid_field + time + seating in the spec/flags).")
+            await probe_details(client, cfg)
+            return
+
         # --- calibrate, then re-calibrate ~1 min before the drop ---
         if cfg.clock_sync:
             print("Calibrating clock...")
@@ -534,14 +746,25 @@ async def run(cfg: Config) -> None:
         await _sleep_until(drop - timedelta(seconds=cfg.prewarm_lead_s), cfg.clock_offset_s)
         await prewarm(client, cfg)
 
-        # --- poll → first matching slot ---
-        slot = await poll_for_slot(client, cfg)
-        config_token = _slot_token(slot)
-        start = _parse_slot_start(slot)
-        print(f"[find] matched slot @ {start} — piping to details.")
+        if cfg.config_token:
+            # --- DIRECT path: skip /find, poll /details with the constructed token ---
+            config_token = cfg.config_token
+            start = _direct_slot_start(cfg)
+            print(f"[direct] constructed config token: {config_token}")
+            print(f"[direct] POST {URL_DETAILS}")
+            print(f"[direct] headers: {json.dumps(cfg.headers, indent=2)}")
+            print(f"[direct] body: {json.dumps({'commit': cfg.commit, 'config_id': config_token, 'day': cfg.day, 'party_size': cfg.party_size}, indent=2)}")
+            details = await poll_book_token_direct(client, cfg)
+            print(f"[details] book_token minted for slot @ {start} (config_id supplied).")
+        else:
+            # --- poll → first matching slot, then one details handshake ---
+            slot = await poll_for_slot(client, cfg)
+            config_token = _slot_token(slot)
+            start = _parse_slot_start(slot)
+            print(f"[find] matched slot @ {start} — piping to details.")
+            details = await get_book_token(client, cfg, config_token)
 
-        # --- details handshake (in memory, no I/O between steps) ---
-        details = await get_book_token(client, cfg, config_token)
+        assert details is not None  # both paths above only return on a real book_token
         book_token = details.book_token
 
         # If this venue takes a deposit, make sure we have a card to charge. Prefer
@@ -579,15 +802,71 @@ async def run(cfg: Config) -> None:
         print(f"resy_token    : {result.get('resy_token')}")
 
 
+def _set_drop_when(cfg: Config, when: str) -> None:
+    """Parse a 'YYYY-MM-DD HH:MM[:SS]' drop moment into the cfg.drop_* fields."""
+    when = when.strip()
+    fmt = "%Y-%m-%d %H:%M:%S" if when.count(":") == 2 else "%Y-%m-%d %H:%M"
+    dt = datetime.strptime(when, fmt)
+    cfg.drop_date = dt.strftime("%Y-%m-%d")
+    cfg.drop_hour, cfg.drop_minute, cfg.drop_second = dt.hour, dt.minute, dt.second
+
+
+def _load_spec(path: str) -> dict:
+    """Read a TOML reservation spec. stdlib tomllib (3.11+), so no extra dependency."""
+    try:
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+    except FileNotFoundError:
+        raise SystemExit(f"Spec file not found: {path}")
+    except tomllib.TOMLDecodeError as e:
+        raise SystemExit(f"Invalid TOML in {path}: {e}")
+
+
+def _apply_spec(cfg: Config, spec: dict) -> None:
+    """
+    Map a TOML reservation spec onto cfg. This is the canonical input layer; it sits
+    between dataclass defaults and the env/CLI overrides. Unknown keys are ignored.
+        venue_id, party_size, config_id, mid_field   -> ints
+        day, time, seating                            -> strings
+        times (array), tolerance, commit              -> find-mode tuning
+        requires_payment, payment_method_id           -> deposit venues
+        [drop] when / tz                              -> drop timing
+    """
+    for key in ("venue_id", "party_size", "config_id", "mid_field",
+                "tolerance", "commit", "payment_method_id"):
+        if key in spec:
+            target = "time_tolerance_min" if key == "tolerance" else key
+            setattr(cfg, target, int(spec[key]))
+    for key in ("day", "time", "seating"):
+        if key in spec:
+            setattr(cfg, key, str(spec[key]))
+    if "times" in spec:
+        cfg.preferred_times = tuple(str(t).strip() for t in spec["times"])
+    if "requires_payment" in spec:
+        cfg.requires_payment = bool(spec["requires_payment"])
+
+    drop = spec.get("drop") or {}
+    if "tz" in drop:
+        cfg.drop_tz = str(drop["tz"])
+    if "when" in drop:
+        _set_drop_when(cfg, str(drop["when"]))
+
+
 def _build_config(args: argparse.Namespace) -> Config:
     """
-    Resolve a Config from CLI args, falling back to env vars for secrets and to
-    the dataclass defaults for everything else. Credentials come from the
-    environment by default so they never land in your shell history / process list:
+    Resolve a Config in layers, each overriding the one before:
+        dataclass defaults  ->  TOML spec file  ->  env (secrets)  ->  CLI flags
+    Credentials come from the environment so they never land in shell history / argv:
         export RESY_API_KEY=...      RESY_AUTH_TOKEN=eyJ...   RESY_PAYMENT_METHOD_ID=...
+    The reservation itself is data — it lives in the spec file; flags are overrides only.
     """
     cfg = Config()
 
+    # --- layer 1: TOML reservation spec (the canonical input) ---
+    if args.spec:
+        _apply_spec(cfg, _load_spec(args.spec))
+
+    # --- layer 2: secrets from env (CLI --api-key/--auth-token still win) ---
     cfg.api_key = args.api_key or os.environ.get("RESY_API_KEY", cfg.api_key)
     cfg.auth_token = args.auth_token or os.environ.get("RESY_AUTH_TOKEN", cfg.auth_token)
     env_pm = os.environ.get("RESY_PAYMENT_METHOD_ID") or os.environ.get("PAYMENT_METHOD_ID")
@@ -596,34 +875,41 @@ def _build_config(args: argparse.Namespace) -> Config:
     elif env_pm:
         cfg.payment_method_id = int(env_pm)
 
-    cfg.requires_payment = args.requires_payment
-    if cfg.requires_payment and not cfg.payment_method_id:
-        # Fail fast at config time — never discover a missing card mid-drop.
-        raise SystemExit(
-            "--requires-payment is set but no payment method id found. Export "
-            "RESY_PAYMENT_METHOD_ID (or PAYMENT_METHOD_ID), or pass --payment-method-id."
-        )
-
+    # --- layer 3: CLI flag overrides (only when explicitly given) ---
     if args.venue_id is not None:
         cfg.venue_id = args.venue_id
     if args.day is not None:
         cfg.day = args.day
     if args.party_size is not None:
         cfg.party_size = args.party_size
+    if args.time is not None:
+        cfg.time = args.time
+    if args.seating is not None:
+        cfg.seating = args.seating
+    if args.config_id_num is not None:
+        cfg.config_id = args.config_id_num
+    if args.mid_field is not None:
+        cfg.mid_field = args.mid_field
     if args.times is not None:
         cfg.preferred_times = tuple(t.strip() for t in args.times.split(",") if t.strip())
     if args.tolerance is not None:
         cfg.time_tolerance_min = args.tolerance
     if args.commit is not None:
         cfg.commit = args.commit
+    if args.requires_payment:  # store_true: a flag can only turn it on, not off the spec
+        cfg.requires_payment = True
 
-    # Drop timing: either an explicit "YYYY-MM-DD HH:MM[:SS]" or derive it from
-    # the dining day via --release-days-before / --release-time.
+    if cfg.requires_payment and not cfg.payment_method_id:
+        # Fail fast at config time — never discover a missing card mid-drop.
+        raise SystemExit(
+            "requires_payment is set but no payment method id found. Export "
+            "RESY_PAYMENT_METHOD_ID (or PAYMENT_METHOD_ID), set payment_method_id in the "
+            "spec, or pass --payment-method-id."
+        )
+
+    # Drop timing override: explicit --drop, else derive from dining day. CLI beats spec.
     if args.drop is not None:
-        dt = datetime.strptime(args.drop.strip(), "%Y-%m-%d %H:%M:%S" if args.drop.count(":") == 2
-                               else "%Y-%m-%d %H:%M")
-        cfg.drop_date = dt.strftime("%Y-%m-%d")
-        cfg.drop_hour, cfg.drop_minute, cfg.drop_second = dt.hour, dt.minute, dt.second
+        _set_drop_when(cfg, args.drop)
     elif args.release_days_before is not None:
         dine = datetime.strptime(cfg.day, "%Y-%m-%d").date()
         drop_day = dine - timedelta(days=args.release_days_before)
@@ -634,9 +920,26 @@ def _build_config(args: argparse.Namespace) -> Config:
         cfg.drop_tz = args.drop_tz
 
     cfg.dry_run = args.dry_run
+    cfg.probe = args.probe
     cfg.clock_sync = args.clock_sync
     if args.clock_recalibrate_lead is not None:
         cfg.clock_sync_recalibrate_lead_s = args.clock_recalibrate_lead
+
+    # --- layer 4: construct the direct-mode token from the resolved pieces ---
+    # config_id present => direct mode. We build the rgs:// token here so the dining
+    # params have a single source of truth and never disagree with the /details body.
+    if cfg.config_id is not None:
+        missing = [name for name, val in (
+            ("mid_field", cfg.mid_field), ("time", cfg.time), ("seating", cfg.seating),
+        ) if val in (None, "")]
+        if missing:
+            raise SystemExit(
+                "Direct mode (config_id set) also needs: " + ", ".join(missing)
+                + ". Provide them in the spec file or via flags "
+                  "(--mid-field / --time / --seating)."
+            )
+        cfg.config_token = _build_config_token(cfg)
+
     return cfg
 
 
@@ -646,15 +949,27 @@ def _parse_args() -> argparse.Namespace:
                     "Secrets default to env vars: RESY_API_KEY, RESY_AUTH_TOKEN, "
                     "RESY_PAYMENT_METHOD_ID.",
     )
-    # Target
+    # Canonical input: a TOML reservation spec file. Everything below is an override.
+    p.add_argument("spec", nargs="?",
+                   help="Path to a TOML reservation spec file (the canonical input). "
+                        "CLI flags below override individual fields.")
+    # Reservation params (override spec)
     p.add_argument("--venue-id", type=int, help="Resy venue id (e.g. 60029 = Le Gratin)")
     p.add_argument("--day", help="Dining date, YYYY-MM-DD")
     p.add_argument("--party-size", type=int, help="Number of guests")
     p.add_argument("--times", help="Preferred times, priority order, comma-sep 24h HH:MM "
-                                   "(e.g. 19:00,19:30,18:30)")
+                                   "(e.g. 19:00,19:30,18:30)  [find mode]")
     p.add_argument("--tolerance", type=int, help="+/- minutes around each preferred time")
     p.add_argument("--commit", type=int, choices=(0, 1),
                    help="/details commit flag: 0=preview (no token), 1=mint book_token (default 1)")
+    # Direct mode: construct the rgs:// token from these pieces and SKIP /find
+    p.add_argument("--config-id-num", type=int, metavar="N",
+                   help="Opaque slot/template id from a captured token (e.g. 3593815). "
+                        "Setting this enables direct mode.")
+    p.add_argument("--mid-field", type=int, metavar="N",
+                   help="Opaque field right after config_id in the token (e.g. 2 or 3)")
+    p.add_argument("--time", help="Exact slot time HH:MM:SS (direct mode)")
+    p.add_argument("--seating", help='Seating-type label (direct mode), e.g. "Indoor Dining"')
     # Drop timing
     p.add_argument("--drop", help='Explicit drop moment "YYYY-MM-DD HH:MM[:SS]"')
     p.add_argument("--release-days-before", type=int,
@@ -673,6 +988,10 @@ def _parse_args() -> argparse.Namespace:
     # Mode
     p.add_argument("--dry-run", action="store_true",
                    help="Run find + details but STOP before /book (no reservation made)")
+    p.add_argument("--probe", action="store_true",
+                   help="Diagnostic: fire ONE /details for the constructed token right now "
+                        "(no drop wait, no booking) and print exactly what Resy returns. "
+                        "Use against a currently-bookable slot to validate token + auth.")
     p.add_argument("--no-clock-sync", dest="clock_sync", action="store_false",
                    help="Disable server-clock calibration and trust the local clock")
     p.add_argument("--clock-recalibrate-lead", type=float, metavar="SEC",
@@ -689,8 +1008,9 @@ def main() -> None:
             "Missing credentials. Set RESY_API_KEY and RESY_AUTH_TOKEN (env) "
             "or pass --api-key / --auth-token."
         )
+    mode = "DIRECT /details (config_id, no /find)" if cfg.config_token else f"times={cfg.preferred_times}"
     print(f"[config] venue={cfg.venue_id} day={cfg.day} party={cfg.party_size} "
-          f"times={cfg.preferred_times} drop={cfg.drop_date} "
+          f"{mode} drop={cfg.drop_date} "
           f"{cfg.drop_hour:02d}:{cfg.drop_minute:02d} {cfg.drop_tz}"
           f"{'  (DRY RUN)' if cfg.dry_run else ''}")
     try:
