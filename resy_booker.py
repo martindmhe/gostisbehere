@@ -16,10 +16,6 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 1. CONFIG — paste your values here
-# ──────────────────────────────────────────────────────────────────────────────
-
 
 @dataclass
 class Config:
@@ -103,8 +99,6 @@ class Config:
     headers: dict = field(default_factory=dict)
 
     def build_headers(self) -> dict:
-        # >>> VERIFY the Authorization format. Public captures show:
-        #     Authorization: ResyAPI api_key="<key>"
         return {
             "Authorization": f'ResyAPI api_key="{self.api_key}"',
             "X-Resy-Auth-Token": self.auth_token,
@@ -147,6 +141,8 @@ class TokenExpired(Exception):
 
 def _drop_datetime(cfg: Config) -> datetime:
     tz = ZoneInfo(cfg.drop_tz)
+    if cfg.now:
+        return datetime.now(tz)
     d = datetime.strptime(cfg.drop_date, "%Y-%m-%d").date()
     return datetime(
         d.year, d.month, d.day,
@@ -208,16 +204,7 @@ def _slot_token(slot: dict) -> str | None:
 
 
 def _build_config_token(cfg: Config) -> str:
-    """
-    Construct the rgs:// config token from known params + the two opaque pieces the API
-    won't let us compute (config_id, mid_field). Layout, verified against real captures:
-        rgs://resy/<venue>/<config_id>/<mid_field>/<day>/<day>/<time>/<party>/<seating>
-    e.g. rgs://resy/6194/3593815/3/2026-07-15/2026-07-15/12:00:00/2/Indoor Dining
-
-    We build it rather than paste-and-parse so the reservation params have a single
-    source of truth. The format must match byte-for-byte — in direct mode there is no
-    /find fallback — so the dining params feeding this are exactly those used elsewhere.
-    """
+    # build rgs://resy/<venue>/<config_id>/<mid_field>/<day>/<day>/<time>/<party>/<seating>
     return (
         f"rgs://resy/{cfg.venue_id}/{cfg.config_id}/{cfg.mid_field}/"
         f"{cfg.day}/{cfg.day}/{cfg.time}/{cfg.party_size}/{cfg.seating}"
@@ -225,7 +212,7 @@ def _build_config_token(cfg: Config) -> str:
 
 
 def _direct_slot_start(cfg: Config) -> datetime | None:
-    """The slot's start datetime, straight from the run's own params (for logging)."""
+    # build the slot's start datetime from the run's own params
     try:
         return datetime.strptime(f"{cfg.day} {cfg.time}", "%Y-%m-%d %H:%M:%S")
     except ValueError:
@@ -242,9 +229,6 @@ def _raise_for_resy(resp: httpx.Response) -> None:
         raise TokenExpired(f"{resp.status_code} from {resp.url}: {resp.text[:200]}")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 4. The three pipeline steps
-# ──────────────────────────────────────────────────────────────────────────────
 
 
 def _find_body(cfg: Config) -> dict:
@@ -700,11 +684,8 @@ async def run(cfg: Config) -> None:
     cfg.headers = cfg.build_headers()
     limits = httpx.Limits(max_keepalive_connections=8, max_connections=16)
     if cfg.now:
-        # --now flag -> run immediately 
-        drop = datetime.now(ZoneInfo(cfg.drop_tz))
         print(f"[now] running immediately")
-    else:
-        drop = _drop_datetime(cfg)
+    drop = _drop_datetime(cfg)
 
     # HTTP/2 keeps one warm connection multiplexed for the in-flight finds. If the
     # `h2` package isn't installed, httpx raises at client creation — fall back to
@@ -822,15 +803,7 @@ def _load_spec(path: str) -> dict:
 
 
 def _apply_spec(cfg: Config, spec: dict) -> None:
-    """
-    Map a TOML reservation spec onto cfg. This is the canonical input layer; it sits
-    between dataclass defaults and the env/CLI overrides. Unknown keys are ignored.
-        venue_id, party_size, config_id, mid_field   -> ints
-        day, time, seating                            -> strings
-        times (array), tolerance, commit              -> find-mode tuning
-        requires_payment, payment_method_id           -> deposit venues
-        [drop] when / tz                              -> drop timing
-    """
+    # map toml to cfg
     for key in ("venue_id", "party_size", "config_id", "mid_field",
                 "tolerance", "commit", "payment_method_id"):
         if key in spec:
@@ -852,13 +825,7 @@ def _apply_spec(cfg: Config, spec: dict) -> None:
 
 
 def _build_config(args: argparse.Namespace) -> Config:
-    """
-    Resolve a Config in layers, each overriding the one before:
-        dataclass defaults  ->  TOML spec file  ->  env (secrets)  ->  CLI flags
-    Credentials come from the environment so they never land in shell history / argv:
-        export RESY_API_KEY=...      RESY_AUTH_TOKEN=eyJ...   RESY_PAYMENT_METHOD_ID=...
-    The reservation itself is data — it lives in the spec file; flags are overrides only.
-    """
+    # build config from provided arguments
     cfg = Config()
 
     # --- layer 1: TOML reservation spec (the canonical input) ---
