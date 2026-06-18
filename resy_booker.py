@@ -71,7 +71,8 @@ class Config:
     # --- Mode ---
     dry_run: bool = False                           # find + details, but STOP before /book
     probe: bool = False                             # one immediate /details, report, exit
-    now: bool = False                               # run workflow immediately for testing 
+    now: bool = False                               # run workflow immediately for testing
+    log_requests: bool = False                      # write full req/resp log to api_log.jsonl
 
     # --- Timing window (seconds relative to drop) ---
     prewarm_lead_s: float = 5.0                     # open + warm the connection this early
@@ -124,6 +125,47 @@ BASE = "https://api.resy.com"
 URL_FIND = f"{BASE}/4/find"          # POST (JSON body) — confirmed from capture
 URL_DETAILS = f"{BASE}/3/details"    # POST (JSON body) — returns book_token
 URL_BOOK = f"{BASE}/3/book"          # POST (JSON body) — returns resy_token
+
+API_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "api_log.jsonl")
+
+
+def _reset_api_log() -> None:
+    open(API_LOG_PATH, "w").close()
+
+
+def _decode_body(content: bytes) -> object:
+    if not content:
+        return None
+    try:
+        return json.loads(content)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        try:
+            return content.decode("utf-8")
+        except UnicodeDecodeError:
+            return repr(content)
+
+
+async def _log_request(request: httpx.Request) -> None:
+    request.extensions["log_t0"] = time.time()
+
+
+async def _log_response(response: httpx.Response) -> None:
+    await response.aread()
+    request = response.request
+    entry = {
+        "ts": datetime.now().isoformat(timespec="milliseconds"),
+        "method": request.method,
+        "url": str(request.url),
+        "request_headers": dict(request.headers),
+        "request_body": _decode_body(request.content),
+        "status": response.status_code,
+        "response_headers": dict(response.headers),
+        "response_body": _decode_body(response.content),
+        "elapsed_ms": round((time.time() - request.extensions.get("log_t0", time.time())) * 1000, 1),
+    }
+    with open(API_LOG_PATH, "a") as f:
+        json.dump(entry, f, separators=(",", ":"), default=str)
+        f.write("\n")
 
 
 class RateLimited(Exception):
@@ -683,6 +725,9 @@ async def probe_details(client: httpx.AsyncClient, cfg: Config) -> None:
 async def run(cfg: Config) -> None:
     cfg.headers = cfg.build_headers()
     limits = httpx.Limits(max_keepalive_connections=8, max_connections=16)
+    if cfg.log_requests:
+        _reset_api_log()
+        print(f"[log] full request/response log: {API_LOG_PATH}")
     if cfg.now:
         print(f"[now] running immediately")
     drop = _drop_datetime(cfg)
@@ -702,6 +747,10 @@ async def run(cfg: Config) -> None:
         http2=use_http2,
         timeout=cfg.request_timeout_s,
         limits=limits,
+        event_hooks=(
+            {"request": [_log_request], "response": [_log_response]}
+            if cfg.log_requests else {}
+        ),
     ) as client:
         # --- probe: one immediate /details, report, exit (no drop wait, no booking) ---
         if cfg.probe:
@@ -888,6 +937,7 @@ def _build_config(args: argparse.Namespace) -> Config:
     cfg.dry_run = args.dry_run
     cfg.probe = args.probe
     cfg.now = args.now
+    cfg.log_requests = args.log_requests
     cfg.clock_sync = args.clock_sync
     if args.clock_recalibrate_lead is not None:
         cfg.clock_sync_recalibrate_lead_s = args.clock_recalibrate_lead
@@ -964,6 +1014,10 @@ def _parse_args() -> argparse.Namespace:
                         "runs the real find/direct -> details -> book pipeline immediately "
                         "against a currently-bookable slot. Combine with --dry-run to stop "
                         "before /book.")
+    p.add_argument("--log-requests", action="store_true",
+                   help="Write full request/response JSON to api_log.jsonl. Adds a "
+                        "blocking disk write per request, so it's off by default during "
+                        "real drops; turn on for --dry-run/--probe debugging.")
     p.add_argument("--no-clock-sync", dest="clock_sync", action="store_false",
                    help="Disable server-clock calibration and trust the local clock")
     p.add_argument("--clock-recalibrate-lead", type=float, metavar="SEC",

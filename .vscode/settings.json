@@ -1,0 +1,10 @@
+{
+  "[json]": {
+    "editor.formatOnSave": true,
+    "editor.defaultFormatter": "vscode.json-language-features",
+    "editor.wordWrap": "on"
+  },
+  "files.associations": {
+    "api_log.jsonl": "json"
+  }
+}
