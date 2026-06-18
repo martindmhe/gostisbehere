@@ -2,5 +2,8 @@
 .claude/*
 CLAUDE.md
 details_dump.json
+book_dump.json
+api_log*.jsonl
+__pycache__/*
 
 *.toml
