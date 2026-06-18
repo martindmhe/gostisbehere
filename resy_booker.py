@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+from api_log import API_LOG_PATH, log_request, log_response, reset_api_log
 from config import Config
 
 
@@ -27,47 +28,6 @@ BASE = "https://api.resy.com"
 URL_FIND = f"{BASE}/4/find"          # POST (JSON body) — confirmed from capture
 URL_DETAILS = f"{BASE}/3/details"    # POST (JSON body) — returns book_token
 URL_BOOK = f"{BASE}/3/book"          # POST (JSON body) — returns resy_token
-
-API_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "api_log.jsonl")
-
-
-def _reset_api_log() -> None:
-    open(API_LOG_PATH, "w").close()
-
-
-def _decode_body(content: bytes) -> object:
-    if not content:
-        return None
-    try:
-        return json.loads(content)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        try:
-            return content.decode("utf-8")
-        except UnicodeDecodeError:
-            return repr(content)
-
-
-async def _log_request(request: httpx.Request) -> None:
-    request.extensions["log_t0"] = time.time()
-
-
-async def _log_response(response: httpx.Response) -> None:
-    await response.aread()
-    request = response.request
-    entry = {
-        "ts": datetime.now().isoformat(timespec="milliseconds"),
-        "method": request.method,
-        "url": str(request.url),
-        "request_headers": dict(request.headers),
-        "request_body": _decode_body(request.content),
-        "status": response.status_code,
-        "response_headers": dict(response.headers),
-        "response_body": _decode_body(response.content),
-        "elapsed_ms": round((time.time() - request.extensions.get("log_t0", time.time())) * 1000, 1),
-    }
-    with open(API_LOG_PATH, "a") as f:
-        json.dump(entry, f, separators=(",", ":"), default=str)
-        f.write("\n")
 
 
 class RateLimited(Exception):
@@ -628,7 +588,7 @@ async def run(cfg: Config) -> None:
     cfg.headers = cfg.build_headers()
     limits = httpx.Limits(max_keepalive_connections=8, max_connections=16)
     if cfg.log_requests:
-        _reset_api_log()
+        reset_api_log()
         print(f"[log] full request/response log: {API_LOG_PATH}")
     if cfg.now:
         print(f"[now] running immediately")
@@ -650,7 +610,7 @@ async def run(cfg: Config) -> None:
         timeout=cfg.request_timeout_s,
         limits=limits,
         event_hooks=(
-            {"request": [_log_request], "response": [_log_response]}
+            {"request": [log_request], "response": [log_response]}
             if cfg.log_requests else {}
         ),
     ) as client:
