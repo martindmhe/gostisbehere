@@ -1,21 +1,4 @@
 #!/usr/bin/env python3
-"""
-resy_booker.py — Time-boxed Resy reservation grabber (personal use).
-
-Pipeline:  find (poll)  ->  details (token handshake)  ->  book  ->  resy_token
-
-IMPORTANT — read before running:
-  * Automating Resy violates their Terms of Service. Use at your own risk; the
-    account can be flagged/banned. This is intended for booking your OWN table.
-  * The endpoints and JSON shapes below come from PUBLIC reverse-engineering and
-    DO change without notice. VERIFY each request/response against a real browser
-    DevTools "copy as cURL" capture before trusting this script. Spots that must
-    be confirmed are tagged:  # >>> VERIFY
-  * Polling cadence is deliberately moderate (~4–5 req/s with jitter). Hammering
-    at 100ms/10+ req/s is the fastest way to eat a 429 and lose the drop.
-
-Requires: Python 3.11+  (zoneinfo is stdlib)   pip install "httpx[http2]>=0.27"
-"""
 
 from __future__ import annotations
 
@@ -92,6 +75,7 @@ class Config:
     # --- Mode ---
     dry_run: bool = False                           # find + details, but STOP before /book
     probe: bool = False                             # one immediate /details, report, exit
+    now: bool = False                               # run workflow immediately for testing 
 
     # --- Timing window (seconds relative to drop) ---
     prewarm_lead_s: float = 5.0                     # open + warm the connection this early
@@ -715,7 +699,12 @@ async def probe_details(client: httpx.AsyncClient, cfg: Config) -> None:
 async def run(cfg: Config) -> None:
     cfg.headers = cfg.build_headers()
     limits = httpx.Limits(max_keepalive_connections=8, max_connections=16)
-    drop = _drop_datetime(cfg)
+    if cfg.now:
+        # --now flag -> run immediately 
+        drop = datetime.now(ZoneInfo(cfg.drop_tz))
+        print(f"[now] running immediately")
+    else:
+        drop = _drop_datetime(cfg)
 
     # HTTP/2 keeps one warm connection multiplexed for the in-flight finds. If the
     # `h2` package isn't installed, httpx raises at client creation — fall back to
@@ -746,7 +735,7 @@ async def run(cfg: Config) -> None:
             print("Calibrating clock...")
             cfg.clock_offset_s = await calibrate_clock(client, cfg)
 
-            if cfg.clock_sync_recalibrate_lead_s > 0:
+            if cfg.clock_sync_recalibrate_lead_s > 0 and not cfg.now:
                 recal_at = drop - timedelta(seconds=cfg.clock_sync_recalibrate_lead_s)
                 await _sleep_until(recal_at, cfg.clock_offset_s)
                 print(f"[clock] re-calibrating ({cfg.clock_sync_recalibrate_lead_s:.0f}s before drop)...")
@@ -931,6 +920,7 @@ def _build_config(args: argparse.Namespace) -> Config:
 
     cfg.dry_run = args.dry_run
     cfg.probe = args.probe
+    cfg.now = args.now
     cfg.clock_sync = args.clock_sync
     if args.clock_recalibrate_lead is not None:
         cfg.clock_sync_recalibrate_lead_s = args.clock_recalibrate_lead
@@ -1002,6 +992,11 @@ def _parse_args() -> argparse.Namespace:
                    help="Diagnostic: fire ONE /details for the constructed token right now "
                         "(no drop wait, no booking) and print exactly what Resy returns. "
                         "Use against a currently-bookable slot to validate token + auth.")
+    p.add_argument("--now", action="store_true",
+                   help="Testing: treat the current moment as the drop and skip the wait — "
+                        "runs the real find/direct -> details -> book pipeline immediately "
+                        "against a currently-bookable slot. Combine with --dry-run to stop "
+                        "before /book.")
     p.add_argument("--no-clock-sync", dest="clock_sync", action="store_false",
                    help="Disable server-clock calibration and trust the local clock")
     p.add_argument("--clock-recalibrate-lead", type=float, metavar="SEC",
