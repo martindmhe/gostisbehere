@@ -10,7 +10,7 @@ from datetime import timedelta
 
 import httpx
 
-from api_log import API_LOG_PATH, log_request, log_response, reset_api_log
+from api_log import API_LOG_PATH, LOGS_DIR, log_request, log_response, reset_api_log
 from client import (
     URL_DETAILS,
     URL_FIND,
@@ -199,7 +199,7 @@ async def poll_book_token_direct(client: httpx.AsyncClient, cfg: Config) -> Deta
     # Window closed empty. Surface the last raw /details response so we can see WHY
     # (bad/missing auth header, gating, wrong token) instead of guessing.
     if last_debug:
-        dump = os.path.join(os.path.dirname(os.path.abspath(__file__)), "details_dump.json")
+        dump = os.path.join(LOGS_DIR, "details_dump.json")
         try:
             with open(dump, "w") as f:
                 json.dump(last_debug, f, indent=2, default=str)

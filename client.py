@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 
 import httpx
 
+from api_log import LOGS_DIR
 from config import Config
 from errors import RateLimited, TokenExpired
 from slots import pick_best_slot
@@ -130,7 +131,7 @@ async def get_book_token(
             return None
         # Token missing — dump the full response so we can see what Resy actually
         # returned (commit semantics, gating, GDA, etc.) instead of guessing.
-        dump = os.path.join(os.path.dirname(os.path.abspath(__file__)), "details_dump.json")
+        dump = os.path.join(LOGS_DIR, "details_dump.json")
         with open(dump, "w") as f:
             json.dump({"request_body": body, "response": payload}, f, indent=2)
         print(f"[details] no book_token — full response written to {dump}")
@@ -158,7 +159,7 @@ async def book(client: httpx.AsyncClient, cfg: Config, book_token: str) -> dict:
     if not (200 <= resp.status_code < 300):
         # Dump the raw response so a failed /book tells us WHY (stale token, bad
         # field, venue-side rejection) instead of a bare status-code traceback.
-        dump = os.path.join(os.path.dirname(os.path.abspath(__file__)), "book_dump.json")
+        dump = os.path.join(LOGS_DIR, "book_dump.json")
         with open(dump, "w") as f:
             json.dump(
                 {"status": resp.status_code, "request_body": body, "response": resp.text},

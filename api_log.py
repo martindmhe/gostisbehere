@@ -7,7 +7,10 @@ from datetime import datetime
 
 import httpx
 
-API_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "api_log.jsonl")
+LOGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(LOGS_DIR, exist_ok=True)
+
+API_LOG_PATH = os.path.join(LOGS_DIR, "api_log.jsonl")
 
 
 def reset_api_log() -> None:
