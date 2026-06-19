@@ -8,7 +8,8 @@ from datetime import datetime, timedelta
 
 from config import Config
 from errors import RateLimited, TokenExpired
-from resy_booker import _build_config_token, run
+from resy_booker import run
+from slots import build_config_token
 
 
 def _set_drop_when(cfg: Config, when: str) -> None:
@@ -106,7 +107,7 @@ def _build_config(args: argparse.Namespace) -> Config:
                 "Direct mode (config_id set) also needs: " + ", ".join(missing)
                 + ". Provide them in the spec file."
             )
-        cfg.config_token = _build_config_token(cfg)
+        cfg.config_token = build_config_token(cfg)
 
     return cfg
 

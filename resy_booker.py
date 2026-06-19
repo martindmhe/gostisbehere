@@ -17,6 +17,14 @@ import httpx
 from api_log import API_LOG_PATH, log_request, log_response, reset_api_log
 from config import Config
 from errors import RateLimited, TokenExpired
+from slots import (
+    build_config_token,
+    direct_slot_start,
+    drop_datetime,
+    parse_slot_start,
+    pick_best_slot,
+    slot_token,
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -32,86 +40,6 @@ URL_BOOK = f"{BASE}/3/book"          # POST (JSON body) — returns resy_token
 # ──────────────────────────────────────────────────────────────────────────────
 # 3. Helpers
 # ──────────────────────────────────────────────────────────────────────────────
-
-
-def _drop_datetime(cfg: Config) -> datetime:
-    tz = ZoneInfo(cfg.drop_tz)
-    if cfg.now:
-        return datetime.now(tz)
-    d = datetime.strptime(cfg.drop_date, "%Y-%m-%d").date()
-    return datetime(
-        d.year, d.month, d.day,
-        cfg.drop_hour, cfg.drop_minute, cfg.drop_second, tzinfo=tz,
-    )
-
-
-def _parse_slot_start(slot: dict) -> datetime | None:
-    """
-    Pull the slot's start time. Confirmed shape:
-        slot["date"]["start"] == "2026-06-13 20:00:00"
-    """
-    try:
-        raw = slot["date"]["start"]
-        return datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
-    except (KeyError, TypeError, ValueError):
-        return None
-
-
-def _slot_matches(slot_start: datetime, cfg: Config) -> int | None:
-    """Return priority index (lower = better) if slot is within tolerance, else None."""
-    tol = timedelta(minutes=cfg.time_tolerance_min)
-    for priority, pref in enumerate(cfg.preferred_times):
-        h, m = map(int, pref.split(":"))
-        target = slot_start.replace(hour=h, minute=m, second=0, microsecond=0)
-        if abs(slot_start - target) <= tol:
-            return priority
-    return None
-
-
-def _pick_best_slot(find_json: dict, cfg: Config) -> dict | None:
-    """
-    Walk find() results, return the highest-priority matching slot dict.
-    Confirmed path: results.venues[].slots[]
-    """
-    try:
-        venues = find_json["results"]["venues"]
-    except (KeyError, TypeError):
-        return None
-
-    best: tuple[int, dict] | None = None
-    for venue in venues:
-        for slot in venue.get("slots", []):
-            start = _parse_slot_start(slot)
-            if start is None:
-                continue
-            pri = _slot_matches(start, cfg)
-            if pri is None:
-                continue
-            if best is None or pri < best[0]:
-                best = (pri, slot)
-    return best[1] if best else None
-
-
-def _slot_token(slot: dict) -> str | None:
-    # Confirmed: slot["config"]["token"] is the rgs:// config_id passed to /details.
-    # The token encodes the slot time, so each time has a distinct token.
-    return (slot.get("config") or {}).get("token")
-
-
-def _build_config_token(cfg: Config) -> str:
-    # build rgs://resy/<venue>/<config_id>/<mid_field>/<day>/<day>/<time>/<party>/<seating>
-    return (
-        f"rgs://resy/{cfg.venue_id}/{cfg.config_id}/{cfg.mid_field}/"
-        f"{cfg.day}/{cfg.day}/{cfg.time}/{cfg.party_size}/{cfg.seating}"
-    )
-
-
-def _direct_slot_start(cfg: Config) -> datetime | None:
-    # build the slot's start datetime from the run's own params
-    try:
-        return datetime.strptime(f"{cfg.day} {cfg.time}", "%Y-%m-%d %H:%M:%S")
-    except ValueError:
-        return None
 
 
 def _raise_for_resy(resp: httpx.Response) -> None:
@@ -141,7 +69,7 @@ async def find_slot(client: httpx.AsyncClient, cfg: Config) -> dict | None:
     _raise_for_resy(resp)
     if not (200 <= resp.status_code < 300):  # accept any 2xx, not just 200
         return None
-    return _pick_best_slot(resp.json(), cfg)
+    return pick_best_slot(resp.json(), cfg)
 
 
 @dataclass
@@ -394,7 +322,7 @@ async def poll_for_slot(client: httpx.AsyncClient, cfg: Config) -> dict:
     may be in flight (capped by a semaphore); the first matching slot wins and
     cancels the rest.
     """
-    drop = _drop_datetime(cfg)
+    drop = drop_datetime(cfg)
     poll_start = drop - timedelta(seconds=cfg.poll_start_lead_s)
     deadline = drop + timedelta(seconds=cfg.poll_end_lag_s)
 
@@ -423,7 +351,7 @@ async def poll_for_slot(client: httpx.AsyncClient, cfg: Config) -> dict:
             except (httpx.TimeoutException, httpx.TransportError):
                 return  # transient — let the next tick retry
             if slot and not found.done():
-                token = _slot_token(slot)
+                token = slot_token(slot)
                 if token:
                     found.set_result(slot)
 
@@ -456,7 +384,7 @@ async def poll_book_token_direct(client: httpx.AsyncClient, cfg: Config) -> Deta
     poll_for_slot, but the unit of work is a /details call and the prize is a
     DetailsResult (not a slot dict). First success wins and cancels the rest.
     """
-    drop = _drop_datetime(cfg)
+    drop = drop_datetime(cfg)
     poll_start = drop - timedelta(seconds=cfg.poll_start_lead_s)
     deadline = drop + timedelta(seconds=cfg.poll_end_lag_s)
 
@@ -583,7 +511,7 @@ async def run(cfg: Config) -> None:
         print(f"[log] full request/response log: {API_LOG_PATH}")
     if cfg.now:
         print(f"[now] running immediately")
-    drop = _drop_datetime(cfg)
+    drop = drop_datetime(cfg)
 
     # HTTP/2 keeps one warm connection multiplexed for the in-flight finds. If the
     # `h2` package isn't installed, httpx raises at client creation — fall back to
@@ -631,7 +559,7 @@ async def run(cfg: Config) -> None:
         if cfg.config_token:
             # --- DIRECT path: skip /find, poll /details with the constructed token ---
             config_token = cfg.config_token
-            start = _direct_slot_start(cfg)
+            start = direct_slot_start(cfg)
             print(f"[direct] constructed config token: {config_token}")
             print(f"[direct] POST {URL_DETAILS}")
             print(f"[direct] headers: {json.dumps(cfg.headers, indent=2)}")
@@ -641,8 +569,8 @@ async def run(cfg: Config) -> None:
         else:
             # --- poll → first matching slot, then one details handshake ---
             slot = await poll_for_slot(client, cfg)
-            config_token = _slot_token(slot)
-            start = _parse_slot_start(slot)
+            config_token = slot_token(slot)
+            start = parse_slot_start(slot)
             print(f"[find] matched slot @ {start} — piping to details.")
             details = await get_book_token(client, cfg, config_token)
 
