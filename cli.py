@@ -7,7 +7,8 @@ import tomllib
 from datetime import datetime, timedelta
 
 from config import Config
-from resy_booker import RateLimited, TokenExpired, _build_config_token, run
+from errors import RateLimited, TokenExpired
+from resy_booker import _build_config_token, run
 
 
 def _set_drop_when(cfg: Config, when: str) -> None:

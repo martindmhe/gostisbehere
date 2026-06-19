@@ -16,6 +16,7 @@ import httpx
 
 from api_log import API_LOG_PATH, log_request, log_response, reset_api_log
 from config import Config
+from errors import RateLimited, TokenExpired
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -26,14 +27,6 @@ BASE = "https://api.resy.com"
 URL_FIND = f"{BASE}/4/find"          # POST (JSON body) — confirmed from capture
 URL_DETAILS = f"{BASE}/3/details"    # POST (JSON body) — returns book_token
 URL_BOOK = f"{BASE}/3/book"          # POST (JSON body) — returns resy_token
-
-
-class RateLimited(Exception):
-    """Raised on HTTP 429 / Cloudflare challenge. We back off, we do not evade."""
-
-
-class TokenExpired(Exception):
-    """Auth token rejected (401/403) — JWT likely expired; re-grab from browser."""
 
 
 # ──────────────────────────────────────────────────────────────────────────────
