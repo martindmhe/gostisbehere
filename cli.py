@@ -50,46 +50,30 @@ def _apply_spec(cfg: Config, spec: dict) -> None:
         cfg.drop_tz = str(drop["tz"])
     if "when" in drop:
         _set_drop_when(cfg, str(drop["when"]))
+    elif "release_days_before" in drop:
+        # Derive the drop moment from the dining day: release this many days before,
+        # at release_time (default midnight). Only used when "when" isn't given.
+        dine = datetime.strptime(cfg.day, "%Y-%m-%d").date()
+        drop_day = dine - timedelta(days=int(drop["release_days_before"]))
+        h, m = map(int, str(drop.get("release_time", "00:00")).split(":"))
+        cfg.drop_date = drop_day.strftime("%Y-%m-%d")
+        cfg.drop_hour, cfg.drop_minute, cfg.drop_second = h, m, 0
 
 
 def _build_config(args: argparse.Namespace) -> Config:
     # build config from provided arguments
     cfg = Config()
 
-    # --- layer 1: TOML reservation spec (the canonical input) ---
-    if args.spec:
-        _apply_spec(cfg, _load_spec(args.spec))
+    # --- layer 1: TOML reservation spec (the sole source of truth for these fields) ---
+    _apply_spec(cfg, _load_spec(args.spec))
 
-    # --- layer 2: secrets from env (CLI --api-key/--auth-token still win) ---
-    cfg.api_key = args.api_key or os.environ.get("RESY_API_KEY", cfg.api_key)
-    cfg.auth_token = args.auth_token or os.environ.get("RESY_AUTH_TOKEN", cfg.auth_token)
+    # --- layer 2: secrets + remaining overrides from env ---
+    cfg.api_key = os.environ.get("RESY_API_KEY", cfg.api_key)
+    cfg.auth_token = os.environ.get("RESY_AUTH_TOKEN", cfg.auth_token)
     env_pm = os.environ.get("RESY_PAYMENT_METHOD_ID") or os.environ.get("PAYMENT_METHOD_ID")
-    if args.payment_method_id is not None:
-        cfg.payment_method_id = args.payment_method_id
-    elif env_pm:
+    if env_pm:
         cfg.payment_method_id = int(env_pm)
 
-    # --- layer 3: CLI flag overrides (only when explicitly given) ---
-    if args.venue_id is not None:
-        cfg.venue_id = args.venue_id
-    if args.day is not None:
-        cfg.day = args.day
-    if args.party_size is not None:
-        cfg.party_size = args.party_size
-    if args.time is not None:
-        cfg.time = args.time
-    if args.seating is not None:
-        cfg.seating = args.seating
-    if args.config_id_num is not None:
-        cfg.config_id = args.config_id_num
-    if args.mid_field is not None:
-        cfg.mid_field = args.mid_field
-    if args.times is not None:
-        cfg.preferred_times = tuple(t.strip() for t in args.times.split(",") if t.strip())
-    if args.tolerance is not None:
-        cfg.time_tolerance_min = args.tolerance
-    if args.commit is not None:
-        cfg.commit = args.commit
     if args.requires_payment:  # store_true: a flag can only turn it on, not off the spec
         cfg.requires_payment = True
 
@@ -97,21 +81,9 @@ def _build_config(args: argparse.Namespace) -> Config:
         # Fail fast at config time — never discover a missing card mid-drop.
         raise SystemExit(
             "requires_payment is set but no payment method id found. Export "
-            "RESY_PAYMENT_METHOD_ID (or PAYMENT_METHOD_ID), set payment_method_id in the "
-            "spec, or pass --payment-method-id."
+            "RESY_PAYMENT_METHOD_ID (or PAYMENT_METHOD_ID), or set payment_method_id "
+            "in the spec."
         )
-
-    # Drop timing override: explicit --drop, else derive from dining day. CLI beats spec.
-    if args.drop is not None:
-        _set_drop_when(cfg, args.drop)
-    elif args.release_days_before is not None:
-        dine = datetime.strptime(cfg.day, "%Y-%m-%d").date()
-        drop_day = dine - timedelta(days=args.release_days_before)
-        h, m = map(int, args.release_time.split(":"))
-        cfg.drop_date = drop_day.strftime("%Y-%m-%d")
-        cfg.drop_hour, cfg.drop_minute, cfg.drop_second = h, m, 0
-    if args.drop_tz is not None:
-        cfg.drop_tz = args.drop_tz
 
     cfg.dry_run = args.dry_run
     cfg.probe = args.probe
@@ -121,7 +93,7 @@ def _build_config(args: argparse.Namespace) -> Config:
     if args.clock_recalibrate_lead is not None:
         cfg.clock_sync_recalibrate_lead_s = args.clock_recalibrate_lead
 
-    # --- layer 4: construct the direct-mode token from the resolved pieces ---
+    # --- layer 3: construct the direct-mode token from the resolved pieces ---
     # config_id present => direct mode. We build the rgs:// token here so the dining
     # params have a single source of truth and never disagree with the /details body.
     if cfg.config_id is not None:
@@ -131,8 +103,7 @@ def _build_config(args: argparse.Namespace) -> Config:
         if missing:
             raise SystemExit(
                 "Direct mode (config_id set) also needs: " + ", ".join(missing)
-                + ". Provide them in the spec file or via flags "
-                  "(--mid-field / --time / --seating)."
+                + ". Provide them in the spec file."
             )
         cfg.config_token = _build_config_token(cfg)
 
@@ -141,46 +112,17 @@ def _build_config(args: argparse.Namespace) -> Config:
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Time-boxed Resy reservation grabber (personal use). "
-                    "Secrets default to env vars: RESY_API_KEY, RESY_AUTH_TOKEN, "
+        description="Time-boxed Resy reservation grabber (personal use). The TOML spec "
+                    "is the sole source of truth for reservation/timing params. Secrets "
+                    "come from env vars: RESY_API_KEY, RESY_AUTH_TOKEN, "
                     "RESY_PAYMENT_METHOD_ID.",
     )
-    # Canonical input: a TOML reservation spec file. Everything below is an override.
-    p.add_argument("spec", nargs="?",
-                   help="Path to a TOML reservation spec file (the canonical input). "
-                        "CLI flags below override individual fields.")
-    # Reservation params (override spec)
-    p.add_argument("--venue-id", type=int, help="Resy venue id (e.g. 60029 = Le Gratin)")
-    p.add_argument("--day", help="Dining date, YYYY-MM-DD")
-    p.add_argument("--party-size", type=int, help="Number of guests")
-    p.add_argument("--times", help="Preferred times, priority order, comma-sep 24h HH:MM "
-                                   "(e.g. 19:00,19:30,18:30)  [find mode]")
-    p.add_argument("--tolerance", type=int, help="+/- minutes around each preferred time")
-    p.add_argument("--commit", type=int, choices=(0, 1),
-                   help="/details commit flag: 0=preview (no token), 1=mint book_token (default 1)")
-    # Direct mode: construct the rgs:// token from these pieces and SKIP /find
-    p.add_argument("--config-id-num", type=int, metavar="N",
-                   help="Opaque slot/template id from a captured token (e.g. 3593815). "
-                        "Setting this enables direct mode.")
-    p.add_argument("--mid-field", type=int, metavar="N",
-                   help="Opaque field right after config_id in the token (e.g. 2 or 3)")
-    p.add_argument("--time", help="Exact slot time HH:MM:SS (direct mode)")
-    p.add_argument("--seating", help='Seating-type label (direct mode), e.g. "Indoor Dining"')
-    # Drop timing
-    p.add_argument("--drop", help='Explicit drop moment "YYYY-MM-DD HH:MM[:SS]"')
-    p.add_argument("--release-days-before", type=int,
-                   help="Derive drop from dining day: release this many days before")
-    p.add_argument("--release-time", default="00:00",
-                   help="Time-of-day for --release-days-before (HH:MM, default 00:00)")
-    p.add_argument("--drop-tz", help="Drop timezone (default America/New_York)")
-    # Secrets (prefer env vars; these override if given)
-    p.add_argument("--api-key", help="Resy api_key (overrides RESY_API_KEY)")
-    p.add_argument("--auth-token", help="X-Resy-Auth-Token JWT (overrides RESY_AUTH_TOKEN)")
-    p.add_argument("--payment-method-id", type=int,
-                   help="Payment profile id (only for venues with a card hold)")
+    # Canonical input: a TOML reservation spec file. Flags below only control run mode.
+    p.add_argument("spec", help="Path to a TOML reservation spec file.")
     p.add_argument("--requires-payment", action="store_true",
                    help="Venue takes a deposit/card hold: require a payment method id "
-                        "(RESY_PAYMENT_METHOD_ID / PAYMENT_METHOD_ID env) and send it to /book")
+                        "(RESY_PAYMENT_METHOD_ID / PAYMENT_METHOD_ID env, or payment_method_id "
+                        "in the spec) and send it to /book")
     # Mode
     p.add_argument("--dry-run", action="store_true",
                    help="Run find + details but STOP before /book (no reservation made)")
@@ -210,8 +152,7 @@ def main() -> None:
     # Fail fast on obvious misconfiguration before the clock matters.
     if "PASTE" in cfg.api_key or "PASTE" in cfg.auth_token:
         raise SystemExit(
-            "Missing credentials. Set RESY_API_KEY and RESY_AUTH_TOKEN (env) "
-            "or pass --api-key / --auth-token."
+            "Missing credentials. Set RESY_API_KEY and RESY_AUTH_TOKEN env vars."
         )
     mode = "DIRECT /details (config_id, no /find)" if cfg.config_token else f"times={cfg.preferred_times}"
     print(f"[config] venue={cfg.venue_id} day={cfg.day} party={cfg.party_size} "
