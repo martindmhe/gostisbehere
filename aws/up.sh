@@ -59,7 +59,7 @@ AMI_ID=$(aws ssm get-parameters --names "/aws/service/ami-amazon-linux-latest/al
 echo "Latest AL2023 AMI resolved: $AMI_ID"
 
 # 5. Launch Instance
-echo "🖥️ Launching t3.micro instance..."
+echo "🖥️ Launching t3.micro instance and installing packages..."
 INSTANCE_ID=$(aws ec2 run-instances \
   --image-id $AMI_ID \
   --instance-type t3.micro \
@@ -69,6 +69,12 @@ INSTANCE_ID=$(aws ec2 run-instances \
   --iam-instance-profile Name=$PROFILE_NAME \
   --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=resy-runner}]' \
   --region $REGION \
+  --user-data '#!/bin/bash
+sudo dnf update -y
+sudo dnf install -y python3.11 python3.11-pip git
+python3.11 -m pip install --user 'httpx[http2]'
+set -a; source .env 2>/dev/null; set +a
+' \
   --query "Instances[0].InstanceId" --output text)
 
 # 6. Wait for public IP to be assigned
