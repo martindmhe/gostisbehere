@@ -7,3 +7,4 @@ api_log*.jsonl
 __pycache__/*
 
 *.toml
+.env*
