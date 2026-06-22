@@ -138,7 +138,14 @@ async def get_book_token(
         raise
 
 
-async def book(client: httpx.AsyncClient, cfg: Config, book_token: str) -> dict:
+async def book(
+    client: httpx.AsyncClient,
+    cfg: Config,
+    book_token: str,
+    *,
+    dump_on_missing: bool = True,
+    debug_sink: dict | None = None,
+) -> dict | None:
     # CONFIRMED from capture: /book is application/x-www-form-urlencoded (data=, NOT
     # json=). struct_payment_method is a JSON-STRING field value — e.g. {"id":35973316} —
     # and is only sent for venues that take a card hold/deposit (payment_method_id != 0).
@@ -156,6 +163,15 @@ async def book(client: httpx.AsyncClient, cfg: Config, book_token: str) -> dict:
 
     resp = await client.post(URL_BOOK, data=body)
     raise_for_resy(resp)
+
+    # 404 from /book could mean slot isn't live yet, retry (return None) so poll loop can keep hitting /book.
+    if resp.status_code == 404:
+        if debug_sink is not None:
+            debug_sink.update(status=404, body=resp.text[:2000], request_body=body)
+        if dump_on_missing:
+            resp.raise_for_status()
+        return None
+
     if not (200 <= resp.status_code < 300):
         # Dump the raw response so a failed /book tells us WHY (stale token, bad
         # field, venue-side rejection) instead of a bare status-code traceback.

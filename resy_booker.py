@@ -217,6 +217,43 @@ async def poll_book_token_direct(client: httpx.AsyncClient, cfg: Config) -> Deta
     )
 
 
+async def poll_book(client: httpx.AsyncClient, cfg: Config, book_token: str) -> dict:
+    # Retry /book until it succeeds or the polling window closes.
+    drop = drop_datetime(cfg)
+    deadline = drop + timedelta(seconds=cfg.poll_end_lag_s)
+    last_debug: dict = {}
+
+    while True:
+        try:
+            result = await book(
+                client, cfg, book_token,
+                dump_on_missing=False, debug_sink=last_debug,
+            )
+        except RateLimited:
+            result = None
+            await asyncio.sleep(0.75)
+        if result is not None:
+            return result
+        if server_now(drop.tzinfo, cfg.clock_offset_s) >= deadline:
+            break
+        await asyncio.sleep(max(0.05, cfg.poll_interval_s))
+
+    if last_debug:
+        dump = os.path.join(LOGS_DIR, "book_dump.json")
+        try:
+            with open(dump, "w") as f:
+                json.dump(last_debug, f, indent=2, default=str)
+        except OSError:
+            pass
+        print(f"[book] last /book response: HTTP {last_debug.get('status')} — "
+              f"{str(last_debug.get('body'))[:500]}")
+        print(f"[book] full response written to {dump}")
+    raise TimeoutError(
+        "No successful /book inside the polling window — repeatedly got 404 (slot never "
+        "went live in time) before the window closed."
+    )
+
+
 async def probe_details(client: httpx.AsyncClient, cfg: Config) -> None:
     """
     One-shot diagnostic: fire a single /details for the constructed token RIGHT NOW
@@ -359,7 +396,7 @@ async def run(cfg: Config) -> None:
             return
 
         # --- finalize ---
-        result = await book(client, cfg, book_token)
+        result = await poll_book(client, cfg, book_token)
         print("\Booking Successful")
         print(f"slot time     : {start}")
         print(f"reservation_id: {result.get('reservation_id')}")
