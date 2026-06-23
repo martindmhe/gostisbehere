@@ -6,10 +6,14 @@ import os
 import tomllib
 from datetime import datetime, timedelta
 
+from dotenv import load_dotenv
+
 from config import Config
 from errors import RateLimited, TokenExpired
 from resy_booker import run
 from slots import build_config_token
+
+load_dotenv()
 
 
 def _set_drop_when(cfg: Config, when: str) -> None:

@@ -20,7 +20,7 @@ else
     echo "⚠️  No .env file found. Falling back to manual entry..."
     read -p "Resy API Key: " RESY_API_KEY
     read -p "Resy Auth Token (JWT): " RESY_AUTH_TOKEN
-    read -p "Resy Payment Method ID: " RESY_PAYMENT_ID
+    read -p "Resy Payment Method ID: " RESY_PAYMENT_METHOD_ID
 fi
 echo "🚀 Starting setup in $REGION..."
 
@@ -28,7 +28,7 @@ echo "🚀 Starting setup in $REGION..."
 echo "--- Validation Check ---"
 echo "API Key Length: ${#RESY_API_KEY}"
 echo "Auth Token Length: ${#RESY_AUTH_TOKEN}"
-echo "Payment ID Length: ${#RESY_PAYMENT_ID}"
+echo "Payment Method ID Length: ${#RESY_PAYMENT_METHOD_ID}"
 
 # 1. Network discovery
 VPC_ID=$(aws ec2 describe-vpcs --filters "Name=is-default,Values=true" --region $REGION --query "Vpcs[0].VpcId" --output text)
@@ -50,7 +50,7 @@ fi
 echo "🔑 Storing secrets securely in SSM..."
 aws ssm put-parameter --name "/resy/api_key" --value "$RESY_API_KEY" --type "SecureString" --overwrite --region $REGION > /dev/null
 aws ssm put-parameter --name "/resy/auth_token" --value "$RESY_AUTH_TOKEN" --type "SecureString" --overwrite --region $REGION > /dev/null
-aws ssm put-parameter --name "/resy/payment_id" --value "$RESY_PAYMENT_ID" --type "SecureString" --overwrite --region $REGION > /dev/null
+aws ssm put-parameter --name "/resy/payment_method_id" --value "$RESY_PAYMENT_METHOD_ID" --type "SecureString" --overwrite --region $REGION > /dev/null
 
 # 4. Use AWS Systems Manager to fetch the latest AL2023 x86_64 AMI dynamically
 echo "🔍 Resolving latest Amazon Linux 2023 AMI via SSM..."
@@ -72,8 +72,7 @@ INSTANCE_ID=$(aws ec2 run-instances \
   --user-data '#!/bin/bash
 sudo dnf update -y
 sudo dnf install -y python3.11 python3.11-pip git
-python3.11 -m pip install --user 'httpx[http2]'
-set -a; source .env 2>/dev/null; set +a
+python3.11 -m pip install --user 'httpx[http2]' python-dotenv
 ' \
   --query "Instances[0].InstanceId" --output text)
 
