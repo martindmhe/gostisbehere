@@ -17,12 +17,12 @@ if [ -f "$ENV_FILE" ]; then
     # Export variables from .env, ignoring commented lines
     export $(grep -v '^#' "$ENV_FILE" | xargs)
 else
-    echo "⚠️  No .env file found. Falling back to manual entry..."
+    echo "No .env file found. Falling back to manual entry..."
     read -p "Resy API Key: " RESY_API_KEY
     read -p "Resy Auth Token (JWT): " RESY_AUTH_TOKEN
     read -p "Resy Payment Method ID: " RESY_PAYMENT_METHOD_ID
 fi
-echo "🚀 Starting setup in $REGION..."
+echo "Starting setup in $REGION..."
 
 # Quick debug print to see what went wrong (without exposing the whole secret)
 echo "--- Validation Check ---"
@@ -36,7 +36,7 @@ SUBNET_ID=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --re
 MY_IP=$(curl -s https://checkip.amazonaws.com)/32
 
 # 2. Security Group setup
-echo "📦 Setting up Security Group..."
+echo "Setting up Security Group..."
 if aws ec2 describe-security-groups --group-names $SG_NAME --region $REGION >/dev/null 2>&1; then
     SG_ID=$(aws ec2 describe-security-groups --group-names $SG_NAME --region $REGION --query "SecurityGroups[0].GroupId" --output text)
     echo "Found existing Security Group: $SG_ID"
@@ -47,19 +47,19 @@ else
 fi
 
 # 3. Push secrets to SSM Parameter Store
-echo "🔑 Storing secrets securely in SSM..."
+echo "Storing secrets securely in SSM..."
 aws ssm put-parameter --name "/resy/api_key" --value "$RESY_API_KEY" --type "SecureString" --overwrite --region $REGION > /dev/null
 aws ssm put-parameter --name "/resy/auth_token" --value "$RESY_AUTH_TOKEN" --type "SecureString" --overwrite --region $REGION > /dev/null
 aws ssm put-parameter --name "/resy/payment_method_id" --value "$RESY_PAYMENT_METHOD_ID" --type "SecureString" --overwrite --region $REGION > /dev/null
 
 # 4. Use AWS Systems Manager to fetch the latest AL2023 x86_64 AMI dynamically
-echo "🔍 Resolving latest Amazon Linux 2023 AMI via SSM..."
+echo "Resolving latest Amazon Linux 2023 AMI via SSM..."
 AMI_ID=$(aws ssm get-parameters --names "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64" --region $REGION --query "Parameters[0].Value" --output text)
 
 echo "Latest AL2023 AMI resolved: $AMI_ID"
 
 # 5. Launch Instance
-echo "🖥️ Launching t3.micro instance and installing packages..."
+echo "Launching t3.micro instance and installing packages..."
 INSTANCE_ID=$(aws ec2 run-instances \
   --image-id $AMI_ID \
   --instance-type t3.micro \
@@ -78,13 +78,13 @@ sudo python3.11 -m pip install dotenv
   --query "Instances[0].InstanceId" --output text)
 
 # 6. Wait for public IP to be assigned
-echo "⏳ Waiting for instance to boot and get a public IP..."
+echo "Waiting for instance to boot and get a public IP..."
 aws ec2 wait instance-running --instance-ids $INSTANCE_ID --region $REGION
 
 PUBLIC_IP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --region $REGION --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
 
 echo "--------------------------------------------------------"
-echo "✅ Setup Complete!"
+echo "Setup Complete!"
 echo "Instance ID: $INSTANCE_ID"
 echo "Public IP:   $PUBLIC_IP"
 echo "--------------------------------------------------------"
