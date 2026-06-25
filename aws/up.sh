@@ -72,7 +72,8 @@ INSTANCE_ID=$(aws ec2 run-instances \
   --user-data '#!/bin/bash
 sudo dnf update -y
 sudo dnf install -y python3.11 python3.11-pip git
-python3.11 -m pip install --user 'httpx[http2]' python-dotenv
+sudo python3.11 -m pip install "httpx[http2]"
+sudo python3.11 -m pip install dotenv
 ' \
   --query "Instances[0].InstanceId" --output text)
 
