@@ -2,7 +2,7 @@
 set -e
 
 # ==========================================
-# CONFIGURATION - CHANGE THESE IF NEEDED
+# CONFIGURATION
 # ==========================================
 REGION="us-east-1"
 KEY_NAME="resy-key"  # <-- Change to your actual AWS Key Pair name
