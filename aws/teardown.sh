@@ -22,6 +22,6 @@ fi
 echo "🗑️ Clearing tokens from SSM Parameter Store..."
 aws ssm delete-parameter --name "/resy/api_key" --region $REGION 2>/dev/null || true
 aws ssm delete-parameter --name "/resy/auth_token" --region $REGION 2>/dev/null || true
-aws ssm delete-parameter --name "/resy/payment_id" --region $REGION 2>/dev/null || true
+aws ssm delete-parameter --name "/resy/payment_method_id" --region $REGION 2>/dev/null || true
 
 echo "Teardown complete."
