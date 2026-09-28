@@ -147,7 +147,7 @@ async def book(
     debug_sink: dict | None = None,
 ) -> dict | None:
     # CONFIRMED from capture: /book is application/x-www-form-urlencoded (data=, NOT
-    # json=). struct_payment_method is a JSON-STRING field value — e.g. {"id":35973316} —
+    # json=). struct_payment_method is a JSON-STRING field value — e.g. {"id":12345678} —
     # and is only sent for venues that take a card hold/deposit (payment_method_id != 0).
     body: dict = {
         "book_token": book_token,
@@ -155,8 +155,6 @@ async def book(
         "venue_marketing_opt_in": 0,
     }
     if cfg.requires_payment or cfg.payment_method_id:
-        # MUST be a JSON STRING literal field value, compact (no spaces) to match the
-        # real /book capture exactly:  struct_payment_method={"id":35973316}
         body["struct_payment_method"] = json.dumps(
             {"id": cfg.payment_method_id}, separators=(",", ":")
         )
